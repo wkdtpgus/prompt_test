@@ -3,6 +3,8 @@ Pydantic 스키마 정의
 DB 테이블 구조에 맞춘 데이터 스키마
 """
 from pydantic import BaseModel, Field
+from dataclasses import dataclass
+from typing import List
 
 
 class Book(BaseModel):
@@ -13,13 +15,30 @@ class Book(BaseModel):
     source_path: str | None = Field(default=None, description="원본 파일 경로")
 
 
+class Chapter(BaseModel):
+    """chapters 테이블 매칭"""
+    id: int | None = Field(default=None, description="챕터 ID (DB 자동생성)")
+    book_id: int = Field(description="책 ID (FK)")
+    chapter_number: int = Field(description="챕터 순서 번호")
+    title: str | None = Field(default=None, description="챕터 제목")
+    start_page: int | None = Field(default=None, description="시작 페이지 (PDF 참조용)")
+    end_page: int | None = Field(default=None, description="끝 페이지 (PDF 참조용)")
+    level: int = Field(default=1, description="계층 레벨 (1=Chapter, 2=Section)")
+    parent_chapter_id: int | None = Field(default=None, description="상위 챕터 ID")
+    detection_method: str = Field(default="pattern", description="감지 방법: toc, pattern, fallback")
+
+
 class ParagraphChunk(BaseModel):
-    """paragraph_chunks 테이블 매칭"""
+    """paragraph_chunks 테이블 매칭 (확장)"""
     id: int | None = Field(default=None, description="청크 ID (DB 자동생성)")
     book_id: int | None = Field(default=None, description="책 ID (FK)")
-    page_number: int | None = Field(default=None, description="페이지 번호")
-    paragraph_index: int | None = Field(default=None, description="문단 인덱스")
+    page_number: int | None = Field(default=None, description="페이지 번호 (호환성)")
+    paragraph_index: int | None = Field(default=None, description="전역 문단 인덱스")
     body_text: str = Field(description="원본 문단 텍스트")
+    # 챕터 메타데이터 (확장)
+    chapter_id: int | None = Field(default=None, description="챕터 ID (FK)")
+    chapter_paragraph_index: int | None = Field(default=None, description="챕터 내 문단 인덱스")
+    section_id: int | None = Field(default=None, description="섹션 ID (FK)")
 
 
 class KeyIdea(BaseModel):
@@ -44,3 +63,51 @@ class IdeaGroup(BaseModel):
 class ExtractedIdea(BaseModel):
     """LLM이 추출하는 핵심 아이디어 (프롬프트 출력용)"""
     concept: str = Field(description="온톨로지 노드 제목 (예: LoRA, Attention, Transformer)")
+
+
+# 챕터 감지 결과
+@dataclass
+class DetectedChapter:
+    """챕터 감지 결과"""
+    title: str
+    start_page: int
+    end_page: int | None
+    level: int
+    detection_method: str  # 'toc', 'pattern', 'fallback'
+    confidence: float  # 0.0 ~ 1.0
+
+
+# 계층적 청크 (chunker 출력용)
+@dataclass
+class HierarchicalChunk:
+    """계층적 문단 청크 (챕터 컨텍스트 포함)"""
+    text: str
+    chapter_id: int | None
+    chapter_title: str | None
+    section_id: int | None = None  # 섹션 ID (DB 저장 후 할당)
+    section_title: str | None = None  # 섹션 제목 (LLM 출력)
+    paragraph_index: int = 0  # 전역 인덱스
+    chapter_paragraph_index: int = 0  # 챕터 내 인덱스
+    start_char: int = 0  # 챕터 내 시작 위치
+    end_char: int = 0  # 챕터 내 끝 위치
+
+
+# ============================================================
+# LLM 기반 의미적 청킹 스키마
+# ============================================================
+
+class SemanticParagraph(BaseModel):
+    """LLM이 추출하는 의미 단위 문단"""
+    text: str = Field(description="의미적으로 완결된 문단 텍스트 (원문 그대로)")
+    concept: str = Field(description="이 문단의 핵심 개념 (기술 용어, 예: Transformer, LoRA)")
+    section_title: str | None = Field(
+        default=None,
+        description="이 문단이 속한 섹션 제목 (예: 'What This Book Is Not'). 섹션이 없으면 null"
+    )
+
+
+class ChunkAndExtractResult(BaseModel):
+    """청킹 + 아이디어 추출 통합 결과"""
+    paragraphs: List[SemanticParagraph] = Field(
+        description="의미 단위로 분할된 문단들 (각각 하나의 핵심 개념 포함)"
+    )

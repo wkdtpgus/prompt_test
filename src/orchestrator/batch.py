@@ -1,24 +1,33 @@
 """Batch PDF processing orchestrator.
 
-Main entry point for processing PDFs page-by-page with progress tracking.
+챕터 기반 계층적 PDF 처리.
+챕터 → 섹션 → 문단 → 아이디어 추출 파이프라인.
 """
 
 import os
-from typing import List
+from typing import List, Optional
 from tqdm import tqdm
 
-from src.pdf.parser import extract_pages_lazy, get_pdf_metadata
-from src.pdf.chunker import split_paragraphs
+from src.pdf.parser import get_pdf_metadata, extract_all_pages
+from src.pdf.chunker import split_chapter_into_paragraphs
+from src.pdf.chapter_detector import ChapterDetector
+from src.pdf.text_normalizer import TextNormalizer
 from src.db.connection import get_session
-from src.db.operations import create_book, get_book_by_title
+from src.db.models import Book, Chapter
+from src.db.operations import (
+    create_book,
+    get_book_by_title,
+    create_chapters_from_detected,
+    get_chapters_by_book,
+)
 from src.db.progress import (
-    initialize_progress,
-    get_pending_pages,
-    mark_page_processing,
-    mark_page_completed,
-    mark_page_failed,
-    get_progress_stats,
-    reset_stuck_pages,
+    initialize_chapter_progress,
+    get_pending_chapters,
+    mark_chapter_processing,
+    mark_chapter_completed,
+    mark_chapter_failed,
+    get_chapter_progress_stats,
+    reset_stuck_chapters,
 )
 from src.model.schemas import ParagraphChunk
 from src.workflow.state import State
@@ -28,170 +37,70 @@ from src.workflow.nodes import extract_core_idea, save_to_database
 def process_pdf(
     pdf_path: str,
     resume: bool = False,
-    book_id: int = None,
+    book_id: Optional[int] = None,
     model_version: str = "gemini-2.5-flash",
 ) -> dict:
-    """Process a PDF file page by page.
+    """
+    챕터 기반 계층적 PDF 처리.
+
+    파이프라인:
+    1. 전체 텍스트 추출
+    2. 챕터 감지 (TOC/패턴 기반)
+    3. 챕터별 문단 분할
+    4. 아이디어 추출 및 저장
 
     Args:
-        pdf_path: Path to PDF file
-        resume: If True, resume from last checkpoint
-        book_id: Book ID (for resume mode)
-        model_version: LLM model version to record
+        pdf_path: PDF 파일 경로
+        resume: 재개 모드 여부
+        book_id: 재개 시 책 ID
+        model_version: LLM 모델 버전
 
     Returns:
-        Dictionary with processing statistics
+        처리 통계 딕셔너리
     """
-    if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    if not resume and not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF 파일 없음: {pdf_path}")
 
     session = get_session()
 
     try:
-        # 1. Get or create book record
+        # Phase 1: 책 설정
         if resume and book_id:
-            print(f"📖 Resuming book ID: {book_id}")
-            book = session.query(
-                __import__("src.db.models", fromlist=["Book"]).Book
-            ).filter_by(id=book_id).first()
-
-            if not book:
-                raise ValueError(f"Book ID {book_id} not found")
-
-            # Reset stuck pages
-            stuck_count = reset_stuck_pages(session, book_id)
-            if stuck_count > 0:
-                print(f"⚠️  Reset {stuck_count} stuck pages to pending")
-
+            book, chapters = _resume_book(session, book_id)
         else:
-            # Create new book
-            metadata = get_pdf_metadata(pdf_path)
-            print(f"📖 Processing: {metadata['title']}")
-            print(f"   Author: {metadata['author']}")
-            print(f"   Total pages: {metadata['total_pages']}")
+            book, chapters = _create_book_with_chapters(session, pdf_path)
 
-            # Check if already exists
-            existing_book = get_book_by_title(session, metadata["title"])
-            if existing_book:
-                print(f"⚠️  Book '{metadata['title']}' already exists (ID: {existing_book.id})")
-                print(f"   Use --resume --book-id {existing_book.id} to resume")
-                session.close()
-                return {"error": "Book already exists"}
+        # Phase 2: 대기 중인 챕터 확인
+        pending_chapters = get_pending_chapters(session, book.id)
 
-            book = create_book(
-                session,
-                title=metadata["title"],
-                author=metadata["author"],
-                source_path=pdf_path,
-            )
-            print(f"✅ Created book record (ID: {book.id})")
+        if not pending_chapters:
+            print("✅ 모든 챕터가 처리 완료됨!")
+            return get_chapter_progress_stats(session, book.id)
 
-            # Initialize progress tracking
-            page_numbers = list(range(metadata["total_pages"]))
-            initialize_progress(session, book.id, page_numbers)
+        print(f"\n🚀 {len(pending_chapters)}개 챕터 처리 시작...")
 
-        # 2. Get pages to process
-        pending_pages = get_pending_pages(session, book.id)
+        # Phase 3: 전체 텍스트 추출 (1회만)
+        print("📄 전체 텍스트 추출 중...")
+        pages = extract_all_pages(pdf_path)
+        normalizer = TextNormalizer()
+        full_text = normalizer.normalize_full_text(pages)
+        print(f"   텍스트 길이: {len(full_text):,} 문자")
 
-        if not pending_pages:
-            print("✅ All pages already processed!")
-            stats = get_progress_stats(session, book.id)
-            return stats
+        # 페이지별 문자 위치 계산
+        page_char_positions = _calculate_page_positions(pages)
 
-        print(f"\n🚀 Processing {len(pending_pages)} pages...")
+        # Phase 4: 챕터별 처리
+        stats = _process_chapters(
+            session=session,
+            book=book,
+            full_text=full_text,
+            page_char_positions=page_char_positions,
+            pending_chapters=pending_chapters,
+            model_version=model_version,
+        )
 
-        # 3. Process pages
-        stats = {
-            "total_pages": len(pending_pages),
-            "completed": 0,
-            "failed": 0,
-            "total_paragraphs": 0,
-            "total_ideas": 0,
-        }
-
-        # Create page number to index mapping for lazy loading
-        page_nums_set = set(pending_pages)
-
-        # Get total pages for tqdm
-        total_pages = session.query(
-            __import__("src.db.models", fromlist=["ProcessingProgress"]).ProcessingProgress
-        ).filter_by(book_id=book.id).count()
-
-        for page_num, page_text in tqdm(
-            extract_pages_lazy(pdf_path),
-            total=total_pages,
-            desc="Processing pages",
-        ):
-            # Skip if not in pending list
-            if page_num not in page_nums_set:
-                continue
-
-            try:
-                # Mark as processing
-                mark_page_processing(session, book.id, page_num)
-
-                # Split into paragraphs
-                paragraphs = split_paragraphs(page_text)
-
-                if not paragraphs:
-                    # No content, mark as completed
-                    mark_page_completed(session, book.id, page_num)
-                    stats["completed"] += 1
-                    continue
-
-                stats["total_paragraphs"] += len(paragraphs)
-
-                # Process each paragraph
-                for para_idx, para_text in enumerate(paragraphs):
-                    # Create workflow state
-                    chunk = ParagraphChunk(
-                        page_number=page_num,
-                        paragraph_index=para_idx,
-                        body_text=para_text,
-                    )
-
-                    state = State(
-                        chunk=chunk,
-                        book_id=book.id,
-                        model_version=model_version,
-                    )
-
-                    # Extract idea
-                    state = extract_core_idea(state)
-
-                    if state.error:
-                        print(f"\n⚠️  Error on page {page_num+1}, para {para_idx}: {state.error}")
-                        continue
-
-                    # Save to database
-                    state = save_to_database(state)
-
-                    if state.error:
-                        print(f"\n⚠️  DB error on page {page_num+1}, para {para_idx}: {state.error}")
-                        continue
-
-                    stats["total_ideas"] += 1
-
-                # Mark page as completed
-                mark_page_completed(session, book.id, page_num)
-                stats["completed"] += 1
-
-            except Exception as e:
-                # Mark page as failed
-                mark_page_failed(session, book.id, page_num, str(e))
-                stats["failed"] += 1
-                print(f"\n❌ Page {page_num+1} failed: {str(e)}")
-
-        # 4. Print summary
-        print("\n" + "=" * 60)
-        print("Processing Summary")
-        print("=" * 60)
-        print(f"Total pages: {stats['total_pages']}")
-        print(f"Completed: {stats['completed']}")
-        print(f"Failed: {stats['failed']}")
-        print(f"Total paragraphs: {stats['total_paragraphs']}")
-        print(f"Total ideas extracted: {stats['total_ideas']}")
-        print("=" * 60)
+        # Phase 5: 요약 출력
+        _print_summary(stats)
 
         return stats
 
@@ -199,14 +108,210 @@ def process_pdf(
         session.close()
 
 
+def _resume_book(session, book_id: int) -> tuple:
+    """책 재개."""
+    print(f"📖 책 재개 (ID: {book_id})")
+
+    book = session.query(Book).filter_by(id=book_id).first()
+    if not book:
+        raise ValueError(f"책 ID {book_id} 없음")
+
+    chapters = get_chapters_by_book(session, book_id)
+    if not chapters:
+        raise ValueError(f"책 ID {book_id}에 챕터 없음")
+
+    # 멈춘 챕터 리셋
+    stuck_count = reset_stuck_chapters(session, book_id)
+    if stuck_count > 0:
+        print(f"⚠️  {stuck_count}개 멈춘 챕터 리셋")
+
+    return book, chapters
+
+
+def _create_book_with_chapters(session, pdf_path: str) -> tuple:
+    """책 생성 및 챕터 감지."""
+    # 메타데이터 추출
+    metadata = get_pdf_metadata(pdf_path)
+    print(f"📖 처리 시작: {metadata['title']}")
+    print(f"   저자: {metadata['author']}")
+    print(f"   페이지: {metadata['total_pages']}")
+
+    # 중복 확인
+    existing = get_book_by_title(session, metadata['title'])
+    if existing:
+        print(f"⚠️  '{metadata['title']}' 이미 존재 (ID: {existing.id})")
+        print(f"   재개: --resume --book-id {existing.id}")
+        raise ValueError("책이 이미 존재함")
+
+    # 책 생성
+    book = create_book(
+        session,
+        title=metadata['title'],
+        author=metadata['author'],
+        source_path=pdf_path,
+    )
+    print(f"✅ 책 생성 완료 (ID: {book.id})")
+
+    # 챕터 감지
+    print("🔍 챕터 감지 중...")
+    detector = ChapterDetector(pdf_path)
+    detected_chapters = detector.detect_chapters()
+    print(f"   {len(detected_chapters)}개 챕터 감지됨")
+
+    for ch in detected_chapters[:5]:  # 처음 5개만 출력
+        print(f"     - {ch.title} (p.{ch.start_page+1}-{ch.end_page+1})")
+    if len(detected_chapters) > 5:
+        print(f"     ... 외 {len(detected_chapters)-5}개")
+
+    # DB에 챕터 저장
+    chapters = create_chapters_from_detected(session, book.id, detected_chapters)
+
+    # 진행 추적 초기화
+    initialize_chapter_progress(session, book.id, chapters)
+
+    return book, chapters
+
+
+def _calculate_page_positions(pages: List[str]) -> List[tuple]:
+    """페이지별 문자 위치 계산."""
+    positions = []
+    char_offset = 0
+
+    for page_num, page_text in enumerate(pages):
+        start = char_offset
+        char_offset += len(page_text) + 1  # +1 for join character
+        positions.append((page_num, start, char_offset))
+
+    return positions
+
+
+def _get_chapter_text(
+    full_text: str,
+    page_positions: List[tuple],
+    chapter: Chapter
+) -> str:
+    """챕터 텍스트 추출."""
+    # 시작/끝 페이지의 문자 위치 찾기
+    start_char = 0
+    end_char = len(full_text)
+
+    for page_num, start, end in page_positions:
+        if page_num == chapter.start_page:
+            start_char = start
+        if page_num == chapter.end_page:
+            end_char = end
+            break
+
+    return full_text[start_char:end_char]
+
+
+def _process_chapters(
+    session,
+    book: Book,
+    full_text: str,
+    page_char_positions: List[tuple],
+    pending_chapters: List[Chapter],
+    model_version: str,
+) -> dict:
+    """챕터별 처리 실행."""
+    stats = {
+        'total_chapters': len(pending_chapters),
+        'completed': 0,
+        'failed': 0,
+        'total_paragraphs': 0,
+        'total_ideas': 0,
+    }
+
+    global_para_idx = 0
+
+    for chapter in tqdm(pending_chapters, desc="챕터 처리"):
+        try:
+            mark_chapter_processing(session, book.id, chapter.id)
+
+            # 챕터 텍스트 추출
+            chapter_text = _get_chapter_text(
+                full_text, page_char_positions, chapter
+            )
+
+            if len(chapter_text.strip()) < 100:
+                # 내용이 너무 짧음
+                mark_chapter_completed(session, book.id, chapter.id)
+                stats['completed'] += 1
+                continue
+
+            # 계층적 문단 분할
+            chunks = split_chapter_into_paragraphs(
+                chapter_text=chapter_text,
+                chapter_id=chapter.id,
+                chapter_title=chapter.title,
+                base_paragraph_index=global_para_idx,
+            )
+
+            stats['total_paragraphs'] += len(chunks)
+
+            # 각 문단 처리
+            for chunk in chunks:
+                # ParagraphChunk 스키마로 변환
+                para_chunk = ParagraphChunk(
+                    book_id=book.id,
+                    chapter_id=chunk.chapter_id,
+                    paragraph_index=chunk.paragraph_index,
+                    chapter_paragraph_index=chunk.chapter_paragraph_index,
+                    body_text=chunk.text,
+                    section_id=chunk.section_id,
+                )
+
+                state = State(
+                    chunk=para_chunk,
+                    book_id=book.id,
+                    model_version=model_version,
+                )
+
+                # 아이디어 추출
+                state = extract_core_idea(state)
+
+                if state.error:
+                    continue
+
+                # DB 저장
+                state = save_to_database(state)
+
+                if not state.error:
+                    stats['total_ideas'] += 1
+
+            global_para_idx += len(chunks)
+            mark_chapter_completed(session, book.id, chapter.id)
+            stats['completed'] += 1
+
+        except Exception as e:
+            mark_chapter_failed(session, book.id, chapter.id, str(e))
+            stats['failed'] += 1
+            print(f"\n❌ 챕터 '{chapter.title}' 실패: {e}")
+
+    return stats
+
+
+def _print_summary(stats: dict) -> None:
+    """처리 요약 출력."""
+    print("\n" + "=" * 60)
+    print("처리 요약")
+    print("=" * 60)
+    print(f"총 챕터: {stats['total_chapters']}")
+    print(f"완료: {stats['completed']}")
+    print(f"실패: {stats['failed']}")
+    print(f"총 문단: {stats['total_paragraphs']}")
+    print(f"추출된 아이디어: {stats['total_ideas']}")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Batch PDF processing")
-    parser.add_argument("--pdf", type=str, required=True, help="Path to PDF file")
-    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
-    parser.add_argument("--book-id", type=int, help="Book ID for resume mode")
-    parser.add_argument("--model", type=str, default="gemini-2.5-flash", help="Model version")
+    parser = argparse.ArgumentParser(description="PDF 처리 (챕터 기반)")
+    parser.add_argument("--pdf", type=str, required=True, help="PDF 파일 경로")
+    parser.add_argument("--resume", action="store_true", help="중단된 처리 재개")
+    parser.add_argument("--book-id", type=int, help="재개 시 책 ID")
+    parser.add_argument("--model", type=str, default="gemini-2.5-flash", help="모델 버전")
 
     args = parser.parse_args()
 

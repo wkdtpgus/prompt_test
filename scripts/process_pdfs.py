@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Main CLI entry point for PDF processing.
 
-Process PDFs page-by-page to extract core ideas for knowledge graph.
+챕터 기반 계층적 PDF 처리.
+챕터 → 섹션 → 문단 → 아이디어 추출 파이프라인.
 Supports resume capability and progress tracking.
 """
 

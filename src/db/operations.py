@@ -1,9 +1,13 @@
-"""Database CRUD operations with bulk insert support."""
+"""Database CRUD operations with bulk insert support.
 
-from typing import List
+챕터 기반 CRUD 함수 포함.
+"""
+
+from typing import List, Optional
 from sqlalchemy.orm import Session
 
-from src.db.models import Book, ParagraphChunk, KeyIdea, ProcessingProgress
+from src.db.models import Book, Chapter, Section, ParagraphChunk, KeyIdea, ProcessingProgress
+from src.model.schemas import DetectedChapter, HierarchicalChunk
 
 
 def create_book(session: Session, title: str, author: str = None, source_path: str = None) -> Book:
@@ -123,14 +127,334 @@ def get_ideas_by_book(session: Session, book_id: int) -> List[KeyIdea]:
     return session.query(KeyIdea).filter_by(book_id=book_id).all()
 
 
-def get_ideas_by_concept(session: Session, concept: str) -> List[KeyIdea]:
-    """Get all key ideas for a specific concept.
+# ============================================================
+# 챕터 관련 CRUD 함수
+# ============================================================
+
+def create_chapter(
+    session: Session,
+    book_id: int,
+    chapter_number: int,
+    title: Optional[str] = None,
+    start_page: Optional[int] = None,
+    end_page: Optional[int] = None,
+    level: int = 1,
+    parent_chapter_id: Optional[int] = None,
+    detection_method: str = "pattern"
+) -> Chapter:
+    """챕터 레코드 생성.
 
     Args:
-        session: Database session
-        concept: Concept name (e.g., "LoRA", "Transformer")
+        session: DB 세션
+        book_id: 책 ID
+        chapter_number: 챕터 순서
+        title: 챕터 제목
+        start_page: 시작 페이지
+        end_page: 끝 페이지
+        level: 계층 레벨 (1=Chapter, 2=Section)
+        parent_chapter_id: 상위 챕터 ID
+        detection_method: 감지 방법 ('toc', 'pattern', 'fallback')
 
     Returns:
-        List of KeyIdea objects
+        생성된 Chapter 객체
     """
-    return session.query(KeyIdea).filter_by(core_idea_text=concept).all()
+    chapter = Chapter(
+        book_id=book_id,
+        chapter_number=chapter_number,
+        title=title,
+        start_page=start_page,
+        end_page=end_page,
+        level=level,
+        parent_chapter_id=parent_chapter_id,
+        detection_method=detection_method,
+    )
+    session.add(chapter)
+    session.commit()
+    session.refresh(chapter)
+    return chapter
+
+
+def create_chapters_from_detected(
+    session: Session,
+    book_id: int,
+    detected_chapters: List[DetectedChapter]
+) -> List[Chapter]:
+    """감지된 챕터 리스트를 DB에 저장.
+
+    Args:
+        session: DB 세션
+        book_id: 책 ID
+        detected_chapters: DetectedChapter 리스트
+
+    Returns:
+        생성된 Chapter 객체 리스트
+    """
+    chapters = []
+    for i, detected in enumerate(detected_chapters):
+        chapter = Chapter(
+            book_id=book_id,
+            chapter_number=i + 1,
+            title=detected.title,
+            start_page=detected.start_page,
+            end_page=detected.end_page,
+            level=detected.level,
+            detection_method=detected.detection_method,
+        )
+        session.add(chapter)
+        chapters.append(chapter)
+
+    session.commit()
+
+    # ID 갱신을 위해 refresh
+    for chapter in chapters:
+        session.refresh(chapter)
+
+    return chapters
+
+
+def get_chapters_by_book(session: Session, book_id: int) -> List[Chapter]:
+    """책의 모든 챕터 조회.
+
+    Args:
+        session: DB 세션
+        book_id: 책 ID
+
+    Returns:
+        Chapter 리스트 (chapter_number 순)
+    """
+    return (
+        session.query(Chapter)
+        .filter_by(book_id=book_id)
+        .order_by(Chapter.chapter_number)
+        .all()
+    )
+
+
+def get_chapter_by_id(session: Session, chapter_id: int) -> Optional[Chapter]:
+    """챕터 ID로 조회.
+
+    Args:
+        session: DB 세션
+        chapter_id: 챕터 ID
+
+    Returns:
+        Chapter 객체 또는 None
+    """
+    return session.query(Chapter).filter_by(id=chapter_id).first()
+
+
+def get_chunks_by_chapter(session: Session, chapter_id: int) -> List[ParagraphChunk]:
+    """챕터의 모든 청크 조회.
+
+    Args:
+        session: DB 세션
+        chapter_id: 챕터 ID
+
+    Returns:
+        ParagraphChunk 리스트
+    """
+    return (
+        session.query(ParagraphChunk)
+        .filter_by(chapter_id=chapter_id)
+        .order_by(ParagraphChunk.chapter_paragraph_index)
+        .all()
+    )
+
+
+def save_hierarchical_chunk(
+    session: Session,
+    book_id: int,
+    chunk: HierarchicalChunk
+) -> ParagraphChunk:
+    """계층적 청크를 DB에 저장.
+
+    Args:
+        session: DB 세션
+        book_id: 책 ID
+        chunk: HierarchicalChunk 객체
+
+    Returns:
+        생성된 ParagraphChunk 객체
+    """
+    db_chunk = ParagraphChunk(
+        book_id=book_id,
+        chapter_id=chunk.chapter_id,
+        section_id=chunk.section_id,
+        paragraph_index=chunk.paragraph_index,
+        chapter_paragraph_index=chunk.chapter_paragraph_index,
+        body_text=chunk.text,
+    )
+    session.add(db_chunk)
+    session.commit()
+    session.refresh(db_chunk)
+    return db_chunk
+
+
+def save_hierarchical_chunks_batch(
+    session: Session,
+    book_id: int,
+    chunks: List[HierarchicalChunk]
+) -> List[ParagraphChunk]:
+    """계층적 청크 배치 저장.
+
+    Args:
+        session: DB 세션
+        book_id: 책 ID
+        chunks: HierarchicalChunk 리스트
+
+    Returns:
+        생성된 ParagraphChunk 리스트
+    """
+    db_chunks = []
+    for chunk in chunks:
+        db_chunk = ParagraphChunk(
+            book_id=book_id,
+            chapter_id=chunk.chapter_id,
+            section_id=chunk.section_id,
+            paragraph_index=chunk.paragraph_index,
+            chapter_paragraph_index=chunk.chapter_paragraph_index,
+            body_text=chunk.text,
+        )
+        db_chunks.append(db_chunk)
+
+    session.bulk_save_objects(db_chunks)
+    session.commit()
+    return db_chunks
+
+
+def delete_chapters_by_book(session: Session, book_id: int) -> int:
+    """책의 모든 챕터 삭제.
+
+    Args:
+        session: DB 세션
+        book_id: 책 ID
+
+    Returns:
+        삭제된 챕터 수
+    """
+    count = session.query(Chapter).filter_by(book_id=book_id).delete()
+    session.commit()
+    return count
+
+
+# ============================================================
+# 섹션 관련 CRUD 함수
+# ============================================================
+
+def get_or_create_section(
+    session: Session,
+    chapter_id: int,
+    book_id: int,
+    title: str,
+    section_number: Optional[int] = None
+) -> Section:
+    """섹션 조회 또는 생성 (중복 방지).
+
+    동일 챕터 내 같은 제목의 섹션이 있으면 기존 반환,
+    없으면 새로 생성.
+
+    Args:
+        session: DB 세션
+        chapter_id: 챕터 ID
+        book_id: 책 ID
+        title: 섹션 제목
+        section_number: 섹션 순서 (자동 계산 가능)
+
+    Returns:
+        Section 객체
+    """
+    from sqlalchemy.sql import func
+
+    # 기존 섹션 조회
+    existing = (
+        session.query(Section)
+        .filter_by(chapter_id=chapter_id, title=title)
+        .first()
+    )
+    if existing:
+        return existing
+
+    # 새 섹션 생성
+    if section_number is None:
+        # 현재 챕터의 최대 섹션 번호 + 1
+        max_num = (
+            session.query(func.max(Section.section_number))
+            .filter_by(chapter_id=chapter_id)
+            .scalar()
+        ) or 0
+        section_number = max_num + 1
+
+    section = Section(
+        chapter_id=chapter_id,
+        book_id=book_id,
+        section_number=section_number,
+        title=title,
+        detection_method='llm',
+    )
+    session.add(section)
+    session.flush()  # ID 즉시 할당
+    return section
+
+
+def get_sections_by_chapter(session: Session, chapter_id: int) -> List[Section]:
+    """챕터의 모든 섹션 조회.
+
+    Args:
+        session: DB 세션
+        chapter_id: 챕터 ID
+
+    Returns:
+        Section 리스트 (section_number 순)
+    """
+    return (
+        session.query(Section)
+        .filter_by(chapter_id=chapter_id)
+        .order_by(Section.section_number)
+        .all()
+    )
+
+
+def get_section_by_id(session: Session, section_id: int) -> Optional[Section]:
+    """섹션 ID로 조회.
+
+    Args:
+        session: DB 세션
+        section_id: 섹션 ID
+
+    Returns:
+        Section 객체 또는 None
+    """
+    return session.query(Section).filter_by(id=section_id).first()
+
+
+def get_chunks_by_section(session: Session, section_id: int) -> List[ParagraphChunk]:
+    """섹션의 모든 청크 조회.
+
+    Args:
+        session: DB 세션
+        section_id: 섹션 ID
+
+    Returns:
+        ParagraphChunk 리스트
+    """
+    return (
+        session.query(ParagraphChunk)
+        .filter_by(section_id=section_id)
+        .order_by(ParagraphChunk.chapter_paragraph_index)
+        .all()
+    )
+
+
+def delete_sections_by_chapter(session: Session, chapter_id: int) -> int:
+    """챕터의 모든 섹션 삭제.
+
+    Args:
+        session: DB 세션
+        chapter_id: 챕터 ID
+
+    Returns:
+        삭제된 섹션 수
+    """
+    count = session.query(Section).filter_by(chapter_id=chapter_id).delete()
+    session.commit()
+    return count
