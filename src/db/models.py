@@ -4,10 +4,15 @@ Maps to the existing PostgreSQL schema with additional fields for
 progress tracking and metadata.
 """
 
-from sqlalchemy import Column, Integer, Text, ForeignKey, String, Sequence
+from sqlalchemy import Column, Integer, BigInteger, Text, ForeignKey, String, Sequence, Numeric
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
+
+try:
+    from pgvector.sqlalchemy import Vector
+except ImportError:
+    Vector = None  # pgvector 미설치 시 None
 
 Base = declarative_base()
 
@@ -86,6 +91,10 @@ class ParagraphChunk(Base):
     chapter_paragraph_index = Column(Integer)  # 챕터 내 문단 인덱스
     section_id = Column(Integer, ForeignKey("sections.id"))  # 섹션 참조 (정규화)
 
+    # 중복 제거용 필드
+    paragraph_hash = Column(Text, index=True)  # SHA-256 해시 (정확 매칭)
+    simhash64 = Column(BigInteger, index=True)  # SimHash (유사 매칭)
+
 
 class IdeaGroup(Base):
     """아이디어 묶음 (중복 제거용) - 기존 스키마 유지"""
@@ -137,3 +146,29 @@ class ProcessingProgress(Base):
     # 추가 컬럼 (챕터 기반 추적)
     chapter_id = Column(Integer, ForeignKey("chapters.id"))  # 챕터 기반 진행 추적
     processing_unit = Column(String(50), default='page')  # 'page' or 'chapter'
+
+
+class ParagraphEmbedding(Base):
+    """문단 임베딩 테이블 (벡터 DB)
+
+    paragraph_chunks와 1:1 관계.
+    pgvector 확장 사용.
+    """
+
+    __tablename__ = "paragraph_embeddings"
+
+    id = Column(Integer, Sequence('paragraph_embeddings_id_seq'), primary_key=True)
+    chunk_id = Column(Integer, ForeignKey("paragraph_chunks.id", ondelete="CASCADE"), unique=True, nullable=False)
+    book_id = Column(Integer, ForeignKey("books.id"))
+
+    # 벡터 임베딩 (1536차원 - OpenAI text-embedding-3-small)
+    embedding = Column(Vector(1536)) if Vector else Column(Text)  # pgvector 미설치 시 Text로 fallback
+
+    # 검색 성능용 비정규화
+    body_text = Column(Text, nullable=False)
+
+    # 임베딩 메타데이터
+    model = Column(Text, default='text-embedding-3-small')
+    embedding_cost_cents = Column(Numeric(10, 4))
+
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
